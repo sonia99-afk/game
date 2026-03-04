@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Не доверяй игре</title>
+  <style>
+    html, body { margin:0; height:100%; background:#0b0d12; color:#e8eefc; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    .wrap { display:flex; height:100%; }
+    canvas { display:block; margin:auto; background:linear-gradient(#0b0d12,#0a1224); border:1px solid rgba(255,255,255,.12); border-radius:14px; box-shadow:0 10px 35px rgba(0,0,0,.45); }
+    .hud {
+      position:fixed; left:14px; top:12px; display:flex; gap:10px; align-items:center;
+      background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12);
+      padding:10px 12px; border-radius:12px; backdrop-filter: blur(8px);
+      user-select:none;
+    }
+    .pill { padding:6px 10px; border-radius:999px; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.10); font-size:13px; }
+    .btn { cursor:pointer; padding:8px 10px; border-radius:10px; background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.14); font-weight:600; }
+    .btn:hover{ background:rgba(255,255,255,.12); }
+    .msg {
+      position:fixed; left:50%; top:18%;
+      transform:translateX(-50%);
+      background:rgba(0,0,0,.55); border:1px solid rgba(255,255,255,.14);
+      padding:12px 14px; border-radius:12px; backdrop-filter: blur(8px);
+      font-weight:700; text-align:center; max-width:min(620px, 92vw);
+      display:none;
+    }
+    .tiny { font-size:12px; opacity:.85; font-weight:600; margin-top:6px; }
+  </style>
+</head>
+<body>
+  <div class="hud">
+    <div class="pill" id="status">← → / A D · прыжок Space · double jump</div>
+    <div class="pill">Смерти: <span id="deaths">0</span></div>
+    <div class="btn" id="restart">Restart</div>
+  </div>
+  <div class="msg" id="msg"></div>
+  <div class="wrap">
+    <canvas id="c" width="980" height="560"></canvas>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  const deathsEl = document.getElementById('deaths');
+  const statusEl = document.getElementById('status');
+  const msgEl = document.getElementById('msg');
+  document.getElementById('restart').onclick = () => reset(true);
+
+  // ---------- util ----------
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const rectsOverlap = (a,b) =>
+    a.x < b.x + b.w && a.x + a.w > b.x &&
+    a.y < b.y + b.h && a.y + a.h > b.y;
+
+  function showMsg(text, ms=1400){
+    msgEl.innerHTML = text;
+    msgEl.style.display = 'block';
+    clearTimeout(showMsg._t);
+    showMsg._t = setTimeout(() => msgEl.style.display = 'none', ms);
+  }
+
+  // ---------- input ----------
+  const keys = new Set();
+  window.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (['arrowleft','arrowright','arrowup',' ','a','d','w','r'].includes(k) || e.key === ' ') e.preventDefault();
+    keys.add(k === ' ' ? 'space' : k);
+    if (k === 'r') reset(true);
+  }, { passive:false });
+  window.addEventListener('keyup', (e) => {
+    const k = e.key.toLowerCase();
+    keys.delete(k === ' ' ? 'space' : k);
+  });
+
+  // jump edge-detect (чтобы удержание не жрало оба прыжка подряд)
+  let jumpWasDown = false;
+
+  // ---------- world ----------
+  const W = canvas.width, H = canvas.height;
+
+  const world = {
+    width: 4200,
+    height: 900,
+    gravity: 0.35, // медленнее
+  };
+
+  const platforms = [
+    {x: 0,   y: 500, w: 700, h: 60, type:'solid'},
+    {x: 740, y: 430, w: 220, h: 25, type:'solid'},
+    {x: 1000,y: 370, w: 220, h: 25, type:'solid'},
+    {x: 1280,y: 320, w: 210, h: 24, type:'vanish', alive:true},
+    {x: 1520,y: 420, w: 260, h: 25, type:'solid'},
+    {x: 1900,y: 360, w: 240, h: 24, type:'fake', armed:true},
+    {x: 2200,y: 470, w: 380, h: 30, type:'solid'},
+    {x: 2660,y: 420, w: 240, h: 24, type:'solid'},
+    // красная платформа-ловушка с выдвижными шипами
+{x: 2920, y: 500, w: 220, h: 24, type:'spikeTrap', spikeH:0, maxSpikeH:22},
+    {x: 3160,y: 500, w: 520, h: 26, type:'ice'},
+    // предпоследняя платформа — проваливается
+{x: 3720, y: 440, w: 240, h: 24, type:'break', alive:true, triggered:false, shake:0, vy:0},
+
+// последняя платформа — обычная (стоит “после подставы”)
+{x: 3900, y: 380, w: 180, h: 24, type:'solid'},
+  ];
+
+  const zones = [
+    {x: 1600, y: 0, w: 420, h: 900, kind:'reverse'},
+    {x: 2580, y: 0, w: 260, h: 900, kind:'heavy'},
+  ];
+
+  let goalBase = { x: 4100, y: 320, w: 22, h: 90 };
+  let goal = {...goalBase};
+
+  // ---------- player ----------
+  let player, cam, deaths, state;
+
+  function reset(hard=false){
+    player = {
+      x: 80, y: 380,
+      w: 28, h: 36,
+      vx: 0, vy: 0,
+      onGround: false,
+      coyote: 0,
+      jumpBuffer: 0,
+      fakeTimer: 0,
+      jumps: 2,      // double jump
+    };
+    cam = { x: 0, y: 0 };
+    if (hard) deaths = 0;
+    deathsEl.textContent = deaths;
+    state = {
+      reversed: false,
+      heavy: false,
+      winFakeShown: false,
+      goalMoved: false,
+      trollLevel: 0,
+      _won: false,
+    };
+    for (const p of platforms) if (p.type === 'vanish') p.alive = true;
+    for (const p of platforms) if (p.type === 'fake') p.armed = true;
+    for (const p of platforms) if (p.type === 'break') { p.alive = true; p.triggered = false; p.shake = 0; }
+    goal = {...goalBase};
+    jumpWasDown = false;
+    showMsg('Добеги до 🚩. И… не доверяй игре.', 1700);
+  }
+
+  deaths = 0;
+  reset(true);
+
+  function kill(reason){
+    deaths++;
+    deathsEl.textContent = deaths;
+    const reasons = [
+      'Ой. Это было больно.',
+      'Игра: "случайность". Конечно.',
+      'Ты думал это честно? 🤭',
+      'Ловушка активирована.',
+      'Небольшая… корректировка реальности.',
+    ];
+    showMsg((reason ? reason + '<div class="tiny">' : '') + reasons[(deaths*7 + (reason?3:0)) % reasons.length] + (reason ? '</div>' : ''), 1400);
+    player.x = 80; player.y = 380;
+    player.vx = 0; player.vy = 0;
+    state.goalMoved = false;
+    state.winFakeShown = false;
+    goal = {...goalBase};
+    state.trollLevel = Math.min(3, Math.floor(deaths/3));
+  }
+
+  function touchingPlatformType(type){
+    const probe = {x: player.x+2, y: player.y+player.h, w: player.w-4, h: 2};
+    for (const p of platforms){
+      if ((p.type === 'vanish' || p.type === 'break') && !p.alive) continue;
+      if (p.type !== type) continue;
+      if (rectsOverlap(probe, p)) return true;
+    }
+    return false;
+  }
+
+  // ---------- physics / update ----------
+  function update(){
+    state.reversed = false;
+    state.heavy = false;
+    for (const z of zones){
+      if (rectsOverlap(player, z)){
+        if (z.kind === 'reverse') state.reversed = true;
+        if (z.kind === 'heavy') state.heavy = true;
+      }
+    }
+
+    const leftPressed  = keys.has('arrowleft') || keys.has('a');
+    const rightPressed = keys.has('arrowright') || keys.has('d');
+
+    const jumpDown = keys.has('arrowup') || keys.has('w') || keys.has('space');
+    const jumpPressed = jumpDown && !jumpWasDown; // edge
+    jumpWasDown = jumpDown;
+
+    // jump buffer
+    if (jumpPressed) player.jumpBuffer = 7;
+    else player.jumpBuffer = Math.max(0, player.jumpBuffer - 1);
+
+    // coyote + reset jumps on ground
+    if (player.onGround) {
+      player.coyote = 8;
+      player.jumps = 2;
+    } else {
+      player.coyote = Math.max(0, player.coyote - 1);
+    }
+
+    // controls (may be reversed)
+    let dir = 0;
+    if (leftPressed) dir -= 1;
+    if (rightPressed) dir += 1;
+    if (state.reversed) dir *= -1;
+
+    // movement parameters (slower)
+    const accel = player.onGround ? 1.00 : 0.25;
+    const maxV  = state.heavy ? 3.20 : 4.20;
+    const friction = player.onGround ? 0.80 : 0.92;
+
+    // ice
+    const onIce = player.onGround && touchingPlatformType('ice');
+    const fr = onIce ? 0.94 : friction;
+
+    player.vx += dir * accel;
+    player.vx = clamp(player.vx, -maxV, maxV);
+    player.vx *= fr;
+
+    // jump: allow 2 jumps total; first usually from ground (coyote)
+    if (player.jumpBuffer > 0) {
+      const canGroundJump = player.coyote > 0;
+      const canAirJump = !canGroundJump && player.jumps > 0;
+
+      if (canGroundJump || canAirJump) {
+        player.jumpBuffer = 0;
+        if (canGroundJump) player.coyote = 0;
+
+        player.jumps = Math.max(0, player.jumps - 1);
+
+        const jumpPower = state.heavy ? 8.0 : 10.0;
+        player.vy = -jumpPower;
+        player.onGround = false;
+      }
+    }
+
+    // gravity
+    const g = state.heavy ? world.gravity * 1.35 : world.gravity;
+    player.vy += g;
+    player.vy = clamp(player.vy, -40, 18);
+
+    // integrate x
+    player.x += player.vx;
+    if (player.x < 0) { player.x = 0; player.vx *= -0.2; }
+    if (player.x + player.w > world.width) { player.x = world.width - player.w; player.vx *= -0.2; }
+
+    // collide x
+    for (const p of platforms){
+      if ((p.type === 'vanish' || p.type === 'break') && !p.alive) continue;
+      const solid = (p.type === 'solid' || p.type === 'vanish' || p.type === 'ice' || p.type === 'fake' || p.type === 'break');
+      if (!solid) continue;
+      if (!rectsOverlap(player, p)) continue;
+      if (player.vx > 0) player.x = p.x - player.w;
+      else if (player.vx < 0) player.x = p.x + p.w;
+      player.vx = 0;
+    }
+
+    // integrate y
+    player.y += player.vy;
+
+    if (player.y > world.height + 200) {
+      kill('Падение в бездну.');
+      return;
+    }
+
+    // collide y
+    player.onGround = false;
+    for (const p of platforms){
+      if ((p.type === 'vanish' || p.type === 'break') && !p.alive) continue;
+
+      if (p.type === 'spike' && rectsOverlap(player, p)){
+        kill(p.hidden ? 'Ой. "Невидимые" шипы.' : 'Шипы.');
+        return;
+      }
+
+      const solid = (p.type === 'solid' || p.type === 'vanish' || p.type === 'ice' || p.type === 'fake' || p.type === 'break');
+      if (!solid) continue;
+      if (!rectsOverlap(player, p)) continue;
+
+      if (player.vy > 0){
+        player.y = p.y - player.h;
+        player.vy = 0;
+        player.onGround = true;
+
+        if (p.type === 'vanish' && p.alive){
+          p._touched = (p._touched || 0) + 1;
+          if (p._touched >= 1){
+            setTimeout(() => { p.alive = false; }, 50);
+            showMsg('Хорошая платформа. Была.', 900);
+          }
+        }
+
+        if (p.type === 'fake' && p.armed){
+          player.fakeTimer += 1;
+          if (player.fakeTimer > 14){
+            p.armed = false;
+            player.fakeTimer = 0;
+            kill('Эта платформа… обиделась.');
+            return;
+          }
+        } else {
+          player.fakeTimer = 0;
+        }
+
+        // break platform: дрожит и проваливается после наступания
+        if (p.type === 'break' && p.alive && !p.triggered) {
+          p.triggered = true;
+          p.shake = 36; // кадров тряски
+          showMsg('Платформа: "ой..."', 700);
+          setTimeout(() => { p.alive = false; }, 100);
+        }
+
+      } else if (player.vy < 0){
+        player.y = p.y + p.h;
+        player.vy = 0;
+      }
+    }
+
+    // shake decay
+    for (const p of platforms) {
+      if (p.type === 'break' && p.shake > 0) p.shake--;
+    }
+
+    // Goal trolling
+    const distToGoal = Math.abs((player.x + player.w/2) - (goal.x + goal.w/2));
+    const near = distToGoal < 140 && Math.abs(player.y - goal.y) < 220;
+
+    if (near && !state.goalMoved){
+  state.goalMoved = true;
+
+  // улетаем "подальше" — но назад, к середине уровня
+  goal.x = 2100;              // середина (можешь поставить 2000–2400 как нравится)
+  goal.y = 360;               // чуть ниже/выше по вкусу
+  showMsg('Финиш: "Ой! Я передумал!"', 1200);
+}
+
+    if (rectsOverlap(player, goal) && !state.winFakeShown){
+      state.winFakeShown = true;
+      showMsg('ПОБЕДА! 🎉<div class="tiny">…ладно, не торопись радоваться.</div>', 1500);
+      setTimeout(() => {
+        platforms.push({x: player.x - 40, y: player.y + player.h - 2, w: 160, h: 10, type:'spike', hidden:true});
+      }, 600);
+    }
+
+    if (rectsOverlap(player, goal) && state.winFakeShown && (state.goalMoved || deaths >= 1)){
+      showMsg('Окей. На этот раз честно: ты победил ✅<div class="tiny">Нажми Restart или R.</div>', 4000);
+      player.vx = 0; player.vy = 0;
+      state._won = true;
+    }
+
+    // camera
+    cam.x = clamp(player.x - W*0.35, 0, world.width - W);
+    cam.y = 0;
+
+    statusEl.textContent =
+      (state.reversed ? 'Управление перевёрнуто 😈 · ' : '') +
+      (state.heavy ? 'Тяжёлая зона 🧱 · ' : '') +
+      '← → / A D · прыжок Space · double jump';
+  }
+
+  // ---------- render ----------
+  function roundRect(x,y,w,h,r,fill,stroke){
+    const rr = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr, y);
+    ctx.arcTo(x+w, y, x+w, y+h, rr);
+    ctx.arcTo(x+w, y+h, x, y+h, rr);
+    ctx.arcTo(x, y+h, x, y, rr);
+    ctx.arcTo(x, y, x+w, y, rr);
+    ctx.closePath();
+    if (fill) ctx.fill();
+    if (stroke) ctx.stroke();
+  }
+
+  function drawFlag(x,y,w,h){
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,.55)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(x+w/2, y);
+    ctx.lineTo(x+w/2, y+h);
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255,90,150,.75)';
+    ctx.beginPath();
+    ctx.moveTo(x+w/2, y+8);
+    ctx.lineTo(x+w/2 + 40, y+18);
+    ctx.lineTo(x+w/2, y+32);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = '#ff5a7a';
+    ctx.fillRect(x-10, y+h-6, 40, 8);
+    ctx.restore();
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+
+    // stars-ish
+    ctx.save();
+    ctx.globalAlpha = 0.18;
+    for (let i=0;i<60;i++){
+      const x = (i*173) % W;
+      const y = (i*97) % H;
+      ctx.fillRect((x + (cam.x*0.15))%W, y, 2, 2);
+    }
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(-cam.x, -cam.y);
+
+    for (const p of platforms){
+      if ((p.type === 'vanish' || p.type === 'break') && !p.alive) continue;
+
+      if (p.type === 'spike'){
+        ctx.save();
+        ctx.globalAlpha = p.hidden ? 0.10 : 0.55;
+        ctx.fillStyle = '#ff5a7a';
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+        ctx.restore();
+        continue;
+      }
+
+      // platform style
+      if (p.type === 'ice'){
+        ctx.fillStyle = 'rgba(140,200,255,0.22)';
+        ctx.strokeStyle = 'rgba(140,200,255,0.35)';
+      } else if (p.type === 'vanish'){
+  ctx.fillStyle = 'rgba(220,235,255,0.14)';
+  ctx.strokeStyle = 'rgba(220,235,255,0.22)';
+      } else if (p.type === 'break'){
+        ctx.fillStyle = 'rgba(255,255,255,0.14)';
+        ctx.strokeStyle = 'rgba(255,255,255,0.24)';
+      } else {
+        ctx.fillStyle = 'rgba(220,235,255,0.14)';
+        ctx.strokeStyle = 'rgba(220,235,255,0.22)';
+      }
+
+      // shake effect for break platform
+      let ox = 0;
+      if (p.type === 'break' && p.shake > 0) {
+        ox = ((p.shake % 6) - 3) * 0.9; // лёгкая тряска
+      }
+
+      roundRect(p.x + ox, p.y, p.w, p.h, 10, true, true);
+    }
+
+    // zones hint
+    for (const z of zones){
+      ctx.save();
+      ctx.globalAlpha = 0.06;
+      ctx.fillStyle = z.kind === 'reverse' ? '#ff8bd1' : '#a6ff9b';
+      ctx.fillRect(z.x, z.y, z.w, z.h);
+      ctx.restore();
+    }
+
+    drawFlag(goal.x, goal.y, goal.w, goal.h);
+
+    // player
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(player.x+3, player.y+4, player.w, player.h);
+    ctx.restore();
+
+    ctx.fillStyle = '#e8eefc';
+    roundRect(player.x, player.y, player.w, player.h, 8, true, false);
+
+    ctx.fillStyle = '#0b0d12';
+    const facing = (player.vx >= 0) ? 1 : -1;
+    const ex = player.x + player.w/2 + facing*6;
+    ctx.fillRect(ex-6, player.y+12, 3, 3);
+    ctx.fillRect(ex,   player.y+12, 3, 3);
+
+    // progress bar
+    const prog = (player.x / (world.width - player.w));
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = 'rgba(255,255,255,.10)';
+    roundRect(cam.x+18, 18, 220, 10, 999, true, false);
+    ctx.fillStyle = 'rgba(255,255,255,.42)';
+    roundRect(cam.x+18, 18, Math.max(8, 220*clamp(prog,0,1)), 10, 999, true, false);
+    ctx.restore();
+
+    ctx.restore();
+  }
+
+  function loop(){
+    if (!state._won) update();
+    draw();
+    requestAnimationFrame(loop);
+  }
+  loop();
+})();
+</script>
+</body>
+</html>
